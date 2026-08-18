@@ -884,8 +884,12 @@ class App(_BaseApp):
 
     def _show_text_dialog(self, title: str, body: str, confirm: bool = False) -> bool:
         win = tk.Toplevel(self)
+        win.withdraw()
         win.title(title)
-        win.geometry("820x560")
+        self.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty()
+        win.geometry(f"820x560+{x}+{y}")
         win.transient(self)
         win.grab_set()
         result = {"ok": not confirm}
@@ -915,6 +919,9 @@ class App(_BaseApp):
         else:
             ttk.Button(btns, text="关闭", command=lambda: close(True)).pack(side="right")
         win.protocol("WM_DELETE_WINDOW", lambda: close(False if confirm else True))
+        win.deiconify()
+        win.lift()
+        win.focus_force()
         win.wait_window()
         return result["ok"]
 
