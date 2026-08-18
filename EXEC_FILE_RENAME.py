@@ -13,6 +13,8 @@ from ctypes import wintypes
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+APP_NAME = "EXEC_FILE=RENAME/."
+
 WM_DROPFILES = 0x0233
 WM_NULL = 0x0000
 WH_GETMESSAGE = 3
@@ -174,7 +176,7 @@ def collect_files(paths: list[str]) -> list[str]:
 def ask_open_filenames(parent: tk.Misc, initialdir: str) -> list[str]:
     """Windows multi-select with a large buffer so 500 files are not truncated."""
     if os.name != "nt":
-        return list(filedialog.askopenfilenames(title="EXEC_FILE_RENAME — 选择文件", initialdir=initialdir) or [])
+        return list(filedialog.askopenfilenames(title=f"{APP_NAME} — 选择文件", initialdir=initialdir) or [])
 
     OFN_EXPLORER = 0x00080000
     OFN_ALLOWMULTISELECT = 0x00000200
@@ -212,7 +214,7 @@ def ask_open_filenames(parent: tk.Misc, initialdir: str) -> list[str]:
     buffer_chars = 256 * 1024
     file_buf = ctypes.create_unicode_buffer(buffer_chars)
     filter_buf = ctypes.create_unicode_buffer("所有文件\0*.*\0")
-    title_buf = ctypes.create_unicode_buffer(f"EXEC_FILE_RENAME — 选择文件（最多 {MAX_ITEMS} 个）")
+    title_buf = ctypes.create_unicode_buffer(f"{APP_NAME} — 选择文件（最多 {MAX_ITEMS} 个）")
     dir_buf = ctypes.create_unicode_buffer(initialdir)
 
     ofn = OPENFILENAMEW()
@@ -317,7 +319,7 @@ _BaseApp = TkinterDnD.Tk if _TKDND else tk.Tk
 class App(_BaseApp):
     def __init__(self) -> None:
         super().__init__()
-        self.title("EXEC_FILE_RENAME")
+        self.title(APP_NAME)
         self.geometry("1100x680")
         self.minsize(780, 480)
 
@@ -356,7 +358,8 @@ class App(_BaseApp):
 
         hint = ttk.Label(
             root,
-            text=f"EXEC_FILE_RENAME：左边当前文件名，右边可留空。格式（01. / 001）和自定义前缀是两个独立选项，可单独用也可一起用。一次最多 {MAX_ITEMS} 条。",
+            text=f"{APP_NAME}\n左边当前文件名，右边可留空。格式（01. / 001）和自定义前缀是两个独立选项，可单独用也可一起用。一次最多 {MAX_ITEMS} 条。",
+            justify="left",
         )
         hint.pack(anchor="w", pady=(0, 8))
 
@@ -662,7 +665,7 @@ class App(_BaseApp):
             self._append_files(list(paths))
 
     def add_folder(self) -> None:
-        folder = filedialog.askdirectory(title="EXEC_FILE_RENAME — 选择文件夹（仅添加该层文件）", initialdir=self.last_dir)
+        folder = filedialog.askdirectory(title=f"{APP_NAME} — 选择文件夹（仅添加该层文件）", initialdir=self.last_dir)
         if not folder:
             return
         self.last_dir = folder
