@@ -33,7 +33,8 @@ python EXEC_FILE_RENAME.py
 
 ### 可选依赖
 
-建议安装 `tkinterdnd2`，可获得更稳定的拖放体验；未安装时仍可使用系统拖放功能。
+拖放功能开箱即用：程序内置 Windows 原生拖放支持（32 / 64 位 Python 均可用），无需安装任何依赖。
+`tkinterdnd2` 为可选增强，安装后程序会自动改用它。
 
 ```bash
 pip install tkinterdnd2
