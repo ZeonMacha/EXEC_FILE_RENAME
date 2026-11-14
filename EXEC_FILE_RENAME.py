@@ -43,7 +43,9 @@ _PENDING_DROPS: list[list[str]] = []
 
 
 def normalize_drop_path(raw: str) -> str:
-    path = raw.strip().strip("{}")
+    # No stripping here: leading/trailing spaces and braces are legal in
+    # Windows file names, and splitlist already unbraced grouped elements.
+    path = raw
     if path.lower().startswith("file:"):
         from urllib.parse import unquote, urlparse
         parsed = urlparse(path)
@@ -109,6 +111,9 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
     set_hook = user32.SetWindowsHookExW
     set_hook.restype = ctypes.c_void_p
     set_hook.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+    enum_child_windows = user32.EnumChildWindows
+    enum_child_windows.restype = wintypes.BOOL
+    enum_child_windows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
 
     class POINT(ctypes.Structure):
         _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
@@ -151,7 +156,7 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
 
         hook["enum"] = WNDENUMPROC(enum_cb)
         if root_hwnd:
-            user32.EnumChildWindows(root_hwnd, hook["enum"], 0)
+            enum_child_windows(root_hwnd, hook["enum"], 0)
 
     @HOOKPROC
     def getmsg_proc(ncode, wparam, lparam):
@@ -193,6 +198,9 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
     hook = {"id": None, "proc": None, "enum": None, "cancel": cancel}
 
     def attach() -> None:
+        if not toplevel_hwnd():
+            widget.after(400, attach)
+            return
         enable_tree()
         hook["proc"] = getmsg_proc
         hook["id"] = set_hook(
@@ -702,9 +710,11 @@ class App(_BaseApp):
     def _on_tkdnd(self, event) -> str:
         data = getattr(event, "data", "") or ""
         try:
-            paths = [p.strip().strip("{}") for p in self.tk.splitlist(data) if p]
+            # splitlist already unbraces grouped elements; keep paths verbatim
+            # (leading spaces / braces are legal in Windows file names).
+            paths = [p for p in self.tk.splitlist(data) if p]
         except tk.TclError:
-            paths = [data.strip().strip("{}")] if data.strip() else []
+            paths = [data] if data.strip() else []
         self._on_drop(paths)
         return "copy"
 
