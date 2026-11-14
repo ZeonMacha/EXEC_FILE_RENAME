@@ -19,8 +19,6 @@ WM_DROPFILES = 0x0233
 WM_NULL = 0x0000
 WH_GETMESSAGE = 3
 PM_REMOVE = 1
-GWL_EXSTYLE = -20
-WS_EX_ACCEPTFILES = 0x00000010
 INVALID_CHARS = '<>:"/\\|?*'
 EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,5}$")
 MAX_ITEMS = 500
@@ -40,6 +38,9 @@ except Exception:
     TkinterDnD = None
     _TKDND = False
 
+# WM_DROPFILES handles stashed by the message hook, delivered by the Tk pump.
+_PENDING_DROPS: list[list[str]] = []
+
 
 def normalize_drop_path(raw: str) -> str:
     path = raw.strip().strip("{}")
@@ -54,20 +55,37 @@ def normalize_drop_path(raw: str) -> str:
 
 
 def query_dropped_files(hdrop) -> list[str]:
-    shell32 = ctypes.windll.shell32
-    count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+    drag_query_file = ctypes.windll.shell32.DragQueryFileW
+    drag_query_file.restype = wintypes.UINT
+    drag_query_file.argtypes = [
+        ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(wintypes.WCHAR), wintypes.UINT,
+    ]
+    drag_finish = ctypes.windll.shell32.DragFinish
+    drag_finish.argtypes = [ctypes.c_void_p]
+    count = drag_query_file(hdrop, 0xFFFFFFFF, None, 0)
     paths: list[str] = []
-    for index in range(count):
-        length = shell32.DragQueryFileW(hdrop, index, None, 0)
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        shell32.DragQueryFileW(hdrop, index, buffer, length + 1)
-        if buffer.value:
-            paths.append(buffer.value)
-    shell32.DragFinish(hdrop)
+    try:
+        for index in range(count):
+            length = drag_query_file(hdrop, index, None, 0)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            drag_query_file(hdrop, index, buffer, length + 1)
+            if buffer.value:
+                paths.append(buffer.value)
+    finally:
+        drag_finish(hdrop)
     return paths
 
 
 def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
+    """Accept Explorer file drops on a Tk window, including child widgets.
+
+    A WH_GETMESSAGE hook intercepts WM_DROPFILES, queries the dropped paths
+    right away (pure ctypes — no Tkinter calls from the hook, Tcl holds no
+    GIL while dispatching) and queues them; a Tk timer pump forwards them to
+    the callback in the normal event context. All Win32 calls declare full
+    argtypes/restypes, otherwise 64-bit handles (HDROP, LPARAM pointers)
+    raise OverflowError inside the hook and drops die silently.
+    """
     if os.name != "nt":
         return None
 
@@ -75,12 +93,22 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
     shell32 = ctypes.windll.shell32
     is_64 = ctypes.sizeof(ctypes.c_void_p) == 8
     LRESULT = ctypes.c_int64 if is_64 else ctypes.c_long
-    get_long = user32.GetWindowLongPtrW if is_64 else user32.GetWindowLongW
-    set_long = user32.SetWindowLongPtrW if is_64 else user32.SetWindowLongW
-    get_long.restype = ctypes.c_void_p
-    set_long.restype = ctypes.c_void_p
     HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    call_next_hook = user32.CallNextHookEx
+    call_next_hook.restype = LRESULT
+    call_next_hook.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    drag_accept_files = shell32.DragAcceptFiles
+    drag_accept_files.argtypes = [wintypes.HWND, wintypes.BOOL]
+    drag_finish = shell32.DragFinish
+    drag_finish.argtypes = [ctypes.c_void_p]
+    get_parent = user32.GetParent
+    get_parent.argtypes = [wintypes.HWND]
+    get_parent.restype = wintypes.HWND
+    set_hook = user32.SetWindowsHookExW
+    set_hook.restype = ctypes.c_void_p
+    set_hook.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
 
     class POINT(ctypes.Structure):
         _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
@@ -95,8 +123,6 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
             ("pt", POINT),
         ]
 
-    hook = {"id": None, "proc": None, "enum": None}
-
     def toplevel_hwnd() -> int:
         try:
             frame = widget.wm_frame()
@@ -105,18 +131,14 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
         except Exception:
             pass
         hwnd = widget.winfo_id()
-        parent = user32.GetParent(hwnd)
-        return parent or hwnd
+        return get_parent(hwnd) or hwnd
 
     def enable_accept(hwnd: int) -> None:
-        if not hwnd:
-            return
-        try:
-            shell32.DragAcceptFiles(hwnd, True)
-            style = get_long(hwnd, GWL_EXSTYLE) or 0
-            set_long(hwnd, GWL_EXSTYLE, style | WS_EX_ACCEPTFILES)
-        except Exception:
-            pass
+        if hwnd:
+            try:
+                drag_accept_files(hwnd, True)
+            except Exception:
+                pass
 
     def enable_tree() -> None:
         root_hwnd = toplevel_hwnd()
@@ -128,7 +150,8 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
             return True
 
         hook["enum"] = WNDENUMPROC(enum_cb)
-        user32.EnumChildWindows(root_hwnd, hook["enum"], 0)
+        if root_hwnd:
+            user32.EnumChildWindows(root_hwnd, hook["enum"], 0)
 
     @HOOKPROC
     def getmsg_proc(ncode, wparam, lparam):
@@ -136,27 +159,50 @@ def hook_windows_file_drop(widget: tk.Misc, callback) -> object | None:
             msg = ctypes.cast(lparam, ctypes.POINTER(MSG)).contents
             if msg.message == WM_DROPFILES:
                 try:
-                    paths = query_dropped_files(msg.wParam)
-                    widget.after(0, lambda p=paths: callback(p))
+                    _PENDING_DROPS.append(query_dropped_files(msg.wParam))
                 except Exception:
                     try:
-                        shell32.DragFinish(msg.wParam)
+                        drag_finish(msg.wParam)
                     except Exception:
                         pass
                 msg.message = WM_NULL
-        return user32.CallNextHookEx(hook["id"], ncode, wparam, lparam)
+        return call_next_hook(hook["id"], ncode, wparam, lparam)
+
+    pump_job = {"pump": None, "tree": None}
+
+    def pump() -> None:
+        while _PENDING_DROPS:
+            paths = _PENDING_DROPS.pop(0)
+            if paths:
+                try:
+                    callback(paths)
+                except Exception:
+                    pass
+        pump_job["pump"] = widget.after(40, pump)
+
+    def cancel() -> None:
+        for job_id in pump_job.values():
+            if job_id:
+                try:
+                    widget.after_cancel(job_id)
+                except Exception:
+                    pass
+        pump_job["pump"] = None
+        pump_job["tree"] = None
+
+    hook = {"id": None, "proc": None, "enum": None, "cancel": cancel}
 
     def attach() -> None:
         enable_tree()
         hook["proc"] = getmsg_proc
-        user32.SetWindowsHookExW.restype = ctypes.c_void_p
-        hook["id"] = user32.SetWindowsHookExW(
+        hook["id"] = set_hook(
             WH_GETMESSAGE,
             hook["proc"],
             None,
             ctypes.windll.kernel32.GetCurrentThreadId(),
         )
-        widget.after(400, enable_tree)
+        pump_job["pump"] = widget.after(40, pump)
+        pump_job["tree"] = widget.after(400, enable_tree)
 
     widget.after_idle(attach)
     return hook
@@ -184,28 +230,31 @@ def ask_open_filenames(parent: tk.Misc, initialdir: str) -> list[str]:
     OFN_HIDEREADONLY = 0x00000004
     OFN_PATHMUSTEXIST = 0x00000800
 
+    # Pointer fields are POINTER(WCHAR), not LPWSTR: ctypes refuses to
+    # assign a c_wchar array to a c_wchar_p struct field (TypeError), which
+    # made the "添加文件" button fail silently.
     class OPENFILENAMEW(ctypes.Structure):
         _fields_ = [
             ("lStructSize", wintypes.DWORD),
             ("hwndOwner", wintypes.HWND),
             ("hInstance", wintypes.HINSTANCE),
-            ("lpstrFilter", wintypes.LPCWSTR),
-            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("lpstrFilter", ctypes.POINTER(wintypes.WCHAR)),
+            ("lpstrCustomFilter", ctypes.POINTER(wintypes.WCHAR)),
             ("nMaxCustFilter", wintypes.DWORD),
             ("nFilterIndex", wintypes.DWORD),
-            ("lpstrFile", wintypes.LPWSTR),
+            ("lpstrFile", ctypes.POINTER(wintypes.WCHAR)),
             ("nMaxFile", wintypes.DWORD),
-            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("lpstrFileTitle", ctypes.POINTER(wintypes.WCHAR)),
             ("nMaxFileTitle", wintypes.DWORD),
-            ("lpstrInitialDir", wintypes.LPCWSTR),
-            ("lpstrTitle", wintypes.LPCWSTR),
+            ("lpstrInitialDir", ctypes.POINTER(wintypes.WCHAR)),
+            ("lpstrTitle", ctypes.POINTER(wintypes.WCHAR)),
             ("Flags", wintypes.DWORD),
             ("nFileOffset", wintypes.WORD),
             ("nFileExtension", wintypes.WORD),
-            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lpstrDefExt", ctypes.POINTER(wintypes.WCHAR)),
             ("lCustData", wintypes.LPARAM),
             ("lpfnHook", ctypes.c_void_p),
-            ("lpTemplateName", wintypes.LPCWSTR),
+            ("lpTemplateName", ctypes.POINTER(wintypes.WCHAR)),
             ("pvReserved", ctypes.c_void_p),
             ("dwReserved", wintypes.DWORD),
             ("FlagsEx", wintypes.DWORD),
@@ -471,6 +520,12 @@ class App(_BaseApp):
         self.serial_start.trace_add("write", lambda *_: self._on_serial_change())
 
     def _on_close(self) -> None:
+        hook = self._drop_hook
+        if isinstance(hook, dict) and hook.get("cancel"):
+            try:
+                hook["cancel"]()
+            except Exception:
+                pass
         try:
             self.unbind_all("<MouseWheel>")
             self.unbind_all("<Button-4>")
